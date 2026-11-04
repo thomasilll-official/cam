@@ -1,0 +1,2143 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "FS.h"
+#include "SD_MMC.h"
+#include <vector>
+#include <Preferences.h>
+
+// =================================================
+// FREENOVE ESP32-S3 WROOM CAMERA PINS
+// =================================================
+
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     15
+
+#define SIOD_GPIO_NUM      4
+#define SIOC_GPIO_NUM      5
+
+#define Y9_GPIO_NUM       16
+#define Y8_GPIO_NUM       17
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       12
+#define Y5_GPIO_NUM       10
+#define Y4_GPIO_NUM        8
+#define Y3_GPIO_NUM        9
+#define Y2_GPIO_NUM       11
+
+#define VSYNC_GPIO_NUM     6
+#define HREF_GPIO_NUM      7
+#define PCLK_GPIO_NUM     13
+
+// =================================================
+// SD CARD PINS - FREENOVE
+// =================================================
+
+#define SD_MMC_CMD 38
+#define SD_MMC_CLK 39
+#define SD_MMC_D0  40
+
+// External camera flash LED output (Freenove board option)
+#define FLASH_LED_GPIO 14
+
+// =================================================
+// WIFI SETTINGS
+// =================================================
+
+const char* AP_SSID = "ESP32-CAMERA";
+const char* AP_PASSWORD = "12345678";
+
+const char* WIFI_SSID = "Airtel_Savira airtel";
+const char* WIFI_PASSWORD = "Vaishali198@";
+
+// =================================================
+// GLOBAL VARIABLES
+// =================================================
+
+WebServer server(80);
+Preferences preferences;
+
+// Persistent camera configuration (stored in ESP32 NVS flash memory).
+String savedResolution = "QVGA";
+int savedQuality = 12;
+int savedBrightness = 1;
+int savedContrast = 0;
+int savedSaturation = 0;
+int savedSharpness = 0;
+int savedHmirror = 0;
+int savedVflip = 0;
+bool cctvEnabled = false;
+bool videoSegmentLimitReached = false;
+
+bool cameraReady = false;
+bool sdReady = false;
+bool recording = false;
+bool flashLedOn = false;
+
+File videoFile;
+
+uint32_t frameCount = 0;
+uint32_t videoStartTime = 0;
+
+const uint32_t VIDEO_FPS = 10;
+const uint32_t MAX_VIDEO_FRAMES = 5000;
+
+String currentVideoPath = "";
+
+struct AviIndexEntry {
+  uint32_t offset;
+  uint32_t size;
+};
+
+std::vector<AviIndexEntry> aviIndex;
+
+uint32_t riffSizePos;
+uint32_t moviSizePos;
+uint32_t moviDataStart;
+uint32_t avihFramesPos;
+uint32_t strhFramesPos;
+
+// =================================================
+// AVI FILE HELPERS
+// =================================================
+
+void writeFourCC(File &f, const char *s) {
+  f.write((const uint8_t*)s, 4);
+}
+
+void writeU16(File &f, uint16_t v) {
+  uint8_t b[2] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)(v >> 8)
+  };
+  f.write(b, 2);
+}
+
+void writeU32(File &f, uint32_t v) {
+  uint8_t b[4] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)(v >> 8),
+    (uint8_t)(v >> 16),
+    (uint8_t)(v >> 24)
+  };
+  f.write(b, 4);
+}
+
+void patchU32(File &f, uint32_t pos, uint32_t value) {
+  uint32_t oldPos = f.position();
+  f.seek(pos);
+  writeU32(f, value);
+  f.seek(oldPos);
+}
+
+// =================================================
+// CREATE AVI HEADER
+// =================================================
+
+void writeAviHeader(uint16_t width, uint16_t height) {
+
+  // RIFF HEADER
+
+  writeFourCC(videoFile, "RIFF");
+
+  riffSizePos = videoFile.position();
+  writeU32(videoFile, 0);
+
+  writeFourCC(videoFile, "AVI ");
+
+  // HEADER LIST
+
+  writeFourCC(videoFile, "LIST");
+
+  uint32_t hdrlSizePos = videoFile.position();
+  writeU32(videoFile, 0);
+
+  writeFourCC(videoFile, "hdrl");
+
+  // MAIN AVI HEADER
+
+  writeFourCC(videoFile, "avih");
+  writeU32(videoFile, 56);
+
+  writeU32(videoFile, 1000000 / VIDEO_FPS);
+  writeU32(videoFile, 1000000);
+  writeU32(videoFile, 0);
+  writeU32(videoFile, 0x10);
+
+  avihFramesPos = videoFile.position();
+  writeU32(videoFile, 0);
+
+  writeU32(videoFile, 0);
+  writeU32(videoFile, 1);
+  writeU32(videoFile, width * height * 2);
+  writeU32(videoFile, width);
+  writeU32(videoFile, height);
+
+  for (int i = 0; i < 4; i++) {
+    writeU32(videoFile, 0);
+  }
+
+  // STREAM LIST
+
+  writeFourCC(videoFile, "LIST");
+
+  uint32_t strlSizePos = videoFile.position();
+  writeU32(videoFile, 0);
+
+  writeFourCC(videoFile, "strl");
+
+  // STREAM HEADER
+
+  writeFourCC(videoFile, "strh");
+  writeU32(videoFile, 56);
+
+  writeFourCC(videoFile, "vids");
+  writeFourCC(videoFile, "MJPG");
+
+  writeU32(videoFile, 0);
+  writeU16(videoFile, 0);
+  writeU16(videoFile, 0);
+
+  writeU32(videoFile, 0);
+  writeU32(videoFile, 1);
+  writeU32(videoFile, VIDEO_FPS);
+  writeU32(videoFile, 0);
+
+  strhFramesPos = videoFile.position();
+  writeU32(videoFile, 0);
+
+  writeU32(videoFile, width * height * 2);
+  writeU32(videoFile, 0xFFFFFFFF);
+  writeU32(videoFile, 0);
+
+  writeU16(videoFile, 0);
+  writeU16(videoFile, 0);
+  writeU16(videoFile, width);
+  writeU16(videoFile, height);
+
+  // BITMAP INFO HEADER
+
+  writeFourCC(videoFile, "strf");
+  writeU32(videoFile, 40);
+
+  writeU32(videoFile, 40);
+  writeU32(videoFile, width);
+  writeU32(videoFile, height);
+
+  writeU16(videoFile, 1);
+  writeU16(videoFile, 24);
+
+  writeFourCC(videoFile, "MJPG");
+
+  writeU32(videoFile, width * height * 3);
+  writeU32(videoFile, 0);
+  writeU32(videoFile, 0);
+  writeU32(videoFile, 0);
+  writeU32(videoFile, 0);
+
+  // PATCH LIST SIZES
+
+  uint32_t headerEnd = videoFile.position();
+
+  patchU32(
+    videoFile,
+    strlSizePos,
+    headerEnd - (strlSizePos + 4)
+  );
+
+  patchU32(
+    videoFile,
+    hdrlSizePos,
+    headerEnd - (hdrlSizePos + 4)
+  );
+
+  // MOVIE LIST
+
+  writeFourCC(videoFile, "LIST");
+
+  moviSizePos = videoFile.position();
+  writeU32(videoFile, 0);
+
+  writeFourCC(videoFile, "movi");
+
+  moviDataStart = videoFile.position();
+
+  videoFile.flush();
+}
+
+// =================================================
+// WRITE VIDEO FRAME
+// =================================================
+
+bool writeAviFrame(camera_fb_t *fb) {
+
+  if (!videoFile || !fb) {
+    return false;
+  }
+
+  if (aviIndex.size() >= MAX_VIDEO_FRAMES) {
+    videoSegmentLimitReached = true;
+    stopRecording();
+    return false;
+  }
+
+  uint32_t chunkPosition = videoFile.position();
+
+  writeFourCC(videoFile, "00dc");
+  writeU32(videoFile, fb->len);
+
+  size_t written = videoFile.write(fb->buf, fb->len);
+
+  if (written != fb->len) {
+    Serial.println("SD write error!");
+    stopRecording();
+    return false;
+  }
+
+  if (fb->len & 1) {
+    videoFile.write((uint8_t)0);
+  }
+
+  AviIndexEntry entry;
+
+  entry.offset = chunkPosition - moviDataStart;
+  entry.size = fb->len;
+
+  aviIndex.push_back(entry);
+
+  frameCount++;
+
+  return true;
+}
+
+// =================================================
+// FINALIZE AVI VIDEO
+// =================================================
+
+void stopRecording() {
+
+  if (!recording) {
+    return;
+  }
+
+  recording = false;
+
+  Serial.println("Stopping video recording...");
+
+  if (videoFile) {
+
+    uint32_t moviEnd = videoFile.position();
+
+    patchU32(
+      videoFile,
+      moviSizePos,
+      moviEnd - (moviSizePos + 4)
+    );
+
+    // INDEX CHUNK
+
+    writeFourCC(videoFile, "idx1");
+
+    writeU32(videoFile, aviIndex.size() * 16);
+
+    for (size_t i = 0; i < aviIndex.size(); i++) {
+
+      writeFourCC(videoFile, "00dc");
+
+      writeU32(videoFile, 0x10);
+      writeU32(videoFile, aviIndex[i].offset);
+      writeU32(videoFile, aviIndex[i].size);
+    }
+
+    uint32_t finalSize = videoFile.position();
+
+    // UPDATE FRAME COUNTS
+
+    patchU32(videoFile, avihFramesPos, frameCount);
+    patchU32(videoFile, strhFramesPos, frameCount);
+
+    // UPDATE RIFF SIZE
+
+    patchU32(
+      videoFile,
+      riffSizePos,
+      finalSize - 8
+    );
+
+    videoFile.flush();
+    videoFile.close();
+
+    Serial.print("Video saved: ");
+    Serial.println(currentVideoPath);
+
+    Serial.print("Frames: ");
+    Serial.println(frameCount);
+  }
+
+  aviIndex.clear();
+
+  Serial.println("Recording stopped.");
+}
+
+// =================================================
+// START VIDEO RECORDING
+// =================================================
+
+bool startRecording() {
+
+  if (!sdReady || !cameraReady || recording) {
+    return false;
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    return false;
+  }
+
+  // millis() restarts from zero after a power cycle, so check the SD card
+  // before choosing a name to avoid overwriting an older recording.
+  String videoBase = "/videos/VIDEO_" + String(millis());
+  currentVideoPath = videoBase + ".avi";
+  uint16_t fileSuffix = 1;
+  while (SD_MMC.exists(currentVideoPath)) {
+    currentVideoPath = videoBase + "_" + String(fileSuffix++) + ".avi";
+  }
+
+  videoFile = SD_MMC.open(currentVideoPath, FILE_WRITE);
+
+  if (!videoFile) {
+
+    esp_camera_fb_return(fb);
+
+    Serial.println("Cannot create video file!");
+    return false;
+  }
+
+  frameCount = 0;
+  videoSegmentLimitReached = false;
+  aviIndex.clear();
+
+  aviIndex.reserve(MAX_VIDEO_FRAMES);
+
+  writeAviHeader(fb->width, fb->height);
+
+  recording = true;
+  videoStartTime = millis();
+
+  bool ok = writeAviFrame(fb);
+
+  esp_camera_fb_return(fb);
+
+  if (!ok) {
+    stopRecording();
+    return false;
+  }
+
+  Serial.println("VIDEO RECORDING STARTED!");
+
+  return true;
+}
+
+// =================================================
+// PERSISTENT SETTINGS HELPERS
+// =================================================
+
+framesize_t resolutionToFrameSize(const String &resolution) {
+  if (resolution == "QQVGA") return FRAMESIZE_QQVGA;
+  if (resolution == "QVGA")  return FRAMESIZE_QVGA;
+  if (resolution == "VGA")   return FRAMESIZE_VGA;
+  if (resolution == "SVGA")  return FRAMESIZE_SVGA;
+  if (resolution == "XGA")   return FRAMESIZE_XGA;
+  if (resolution == "HD")    return FRAMESIZE_HD;
+  if (resolution == "SXGA")  return FRAMESIZE_SXGA;
+  if (resolution == "UXGA")  return FRAMESIZE_UXGA;
+  return FRAMESIZE_QVGA;
+}
+
+void loadPersistentSettings() {
+  preferences.begin("camera", true);
+  savedResolution = preferences.getString("resolution", "QVGA");
+  savedQuality = preferences.getInt("quality", 12);
+  savedBrightness = preferences.getInt("brightness", 1);
+  savedContrast = preferences.getInt("contrast", 0);
+  savedSaturation = preferences.getInt("saturation", 0);
+  savedSharpness = preferences.getInt("sharpness", 0);
+  savedHmirror = preferences.getInt("hmirror", 0);
+  savedVflip = preferences.getInt("vflip", 0);
+  cctvEnabled = preferences.getBool("cctv", false);
+  preferences.end();
+
+  // Validate stored values in case NVS contains an old/invalid value.
+  if (savedResolution != "QQVGA" && savedResolution != "QVGA" &&
+      savedResolution != "VGA" && savedResolution != "SVGA" &&
+      savedResolution != "XGA" && savedResolution != "HD" &&
+      savedResolution != "SXGA" && savedResolution != "UXGA") {
+    savedResolution = "QVGA";
+  }
+  savedQuality = constrain(savedQuality, 10, 63);
+  savedBrightness = constrain(savedBrightness, -2, 2);
+  savedContrast = constrain(savedContrast, -2, 2);
+  savedSaturation = constrain(savedSaturation, -2, 2);
+  savedSharpness = constrain(savedSharpness, -2, 2);
+  savedHmirror = savedHmirror ? 1 : 0;
+  savedVflip = savedVflip ? 1 : 0;
+}
+
+void savePersistentSettings() {
+  preferences.begin("camera", false);
+  preferences.putString("resolution", savedResolution);
+  preferences.putInt("quality", savedQuality);
+  preferences.putInt("brightness", savedBrightness);
+  preferences.putInt("contrast", savedContrast);
+  preferences.putInt("saturation", savedSaturation);
+  preferences.putInt("sharpness", savedSharpness);
+  preferences.putInt("hmirror", savedHmirror);
+  preferences.putInt("vflip", savedVflip);
+  preferences.end();
+}
+
+bool applyPersistentCameraSettings() {
+  if (!cameraReady) return false;
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) return false;
+  bool ok = true;
+  if (sensor->set_framesize(sensor, resolutionToFrameSize(savedResolution)) != 0) ok = false;
+  if (sensor->set_quality(sensor, savedQuality) != 0) ok = false;
+  if (sensor->set_brightness(sensor, savedBrightness) != 0) ok = false;
+  if (sensor->set_contrast(sensor, savedContrast) != 0) ok = false;
+  if (sensor->set_saturation(sensor, savedSaturation) != 0) ok = false;
+  if (sensor->set_sharpness(sensor, savedSharpness) != 0) ok = false;
+  if (sensor->set_hmirror(sensor, savedHmirror) != 0) ok = false;
+  if (sensor->set_vflip(sensor, savedVflip) != 0) ok = false;
+  delay(120);
+  return ok;
+}
+
+void handleCCTVStatus() {
+  String json = String("{\"enabled\":") + (cctvEnabled ? "true" : "false") +
+                String(",\"recording\":") + (recording ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSavedSettings() {
+  String json = "{";
+  json += "\"resolution\":\"" + savedResolution + "\",";
+  json += "\"quality\":" + String(savedQuality) + ",";
+  json += "\"brightness\":" + String(savedBrightness) + ",";
+  json += "\"contrast\":" + String(savedContrast) + ",";
+  json += "\"saturation\":" + String(savedSaturation) + ",";
+  json += "\"sharpness\":" + String(savedSharpness) + ",";
+  json += "\"hmirror\":" + String(savedHmirror) + ",";
+  json += "\"vflip\":" + String(savedVflip) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleCCTVToggle() {
+  if (!server.hasArg("state")) {
+    server.send(400, "text/plain", "Missing state");
+    return;
+  }
+  String state = server.arg("state");
+  if (state == "on") {
+    if (!recording && !startRecording()) {
+      server.send(503, "text/plain", "Cannot start recording: check camera and SD card");
+      return;
+    }
+    cctvEnabled = true;
+  } else if (state == "off") {
+    cctvEnabled = false;
+    if (recording) stopRecording();
+  } else {
+    server.send(400, "text/plain", "State must be on or off");
+    return;
+  }
+  preferences.begin("camera", false);
+  preferences.putBool("cctv", cctvEnabled);
+  preferences.end();
+  server.send(200, "text/plain", cctvEnabled ? "CCTV mode ON. Recording is active." : "CCTV mode OFF. Recording stopped.");
+}
+
+// =================================================
+// CAMERA SETTINGS API
+// =================================================
+
+// Apply a setting to the active camera sensor.
+// Resolution changes are blocked while recording so AVI dimensions stay correct.
+void handleCameraSettings() {
+  if (!cameraReady) {
+    server.send(503, "text/plain", "Camera unavailable");
+    return;
+  }
+
+  if (recording) {
+    server.send(409, "text/plain", "Stop recording before changing camera settings");
+    return;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == NULL) {
+    server.send(500, "text/plain", "Camera sensor unavailable");
+    return;
+  }
+
+  bool ok = true;
+
+  if (server.hasArg("resolution")) {
+    String resolution = server.arg("resolution");
+    framesize_t frameSize;
+
+    if      (resolution == "QQVGA") frameSize = FRAMESIZE_QQVGA;
+    else if (resolution == "QVGA")  frameSize = FRAMESIZE_QVGA;
+    else if (resolution == "VGA")   frameSize = FRAMESIZE_VGA;
+    else if (resolution == "SVGA")  frameSize = FRAMESIZE_SVGA;
+    else if (resolution == "XGA")   frameSize = FRAMESIZE_XGA;
+    else if (resolution == "HD")    frameSize = FRAMESIZE_HD;
+    else if (resolution == "SXGA")  frameSize = FRAMESIZE_SXGA;
+    else if (resolution == "UXGA")  frameSize = FRAMESIZE_UXGA;
+    else {
+      server.send(400, "text/plain", "Unsupported resolution");
+      return;
+    }
+
+    if (sensor->set_framesize(sensor, frameSize) != 0) ok = false;
+    delay(150);
+  }
+
+  if (server.hasArg("brightness")) {
+    int v = constrain(server.arg("brightness").toInt(), -2, 2);
+    if (sensor->set_brightness(sensor, v) != 0) ok = false;
+  }
+
+  if (server.hasArg("contrast")) {
+    int v = constrain(server.arg("contrast").toInt(), -2, 2);
+    if (sensor->set_contrast(sensor, v) != 0) ok = false;
+  }
+
+  if (server.hasArg("saturation")) {
+    int v = constrain(server.arg("saturation").toInt(), -2, 2);
+    if (sensor->set_saturation(sensor, v) != 0) ok = false;
+  }
+
+  if (server.hasArg("sharpness")) {
+    int v = constrain(server.arg("sharpness").toInt(), -2, 2);
+    if (sensor->set_sharpness(sensor, v) != 0) ok = false;
+  }
+
+  if (server.hasArg("quality")) {
+    int v = constrain(server.arg("quality").toInt(), 10, 63);
+    if (sensor->set_quality(sensor, v) != 0) ok = false;
+  }
+
+  if (server.hasArg("hmirror")) {
+    int v = server.arg("hmirror").toInt() ? 1 : 0;
+    if (sensor->set_hmirror(sensor, v) != 0) ok = false;
+  }
+
+  if (server.hasArg("vflip")) {
+    int v = server.arg("vflip").toInt() ? 1 : 0;
+    if (sensor->set_vflip(sensor, v) != 0) ok = false;
+  }
+
+  if (ok) {
+    // Save exactly the settings accepted by the UI so they survive power loss.
+    if (server.hasArg("resolution")) savedResolution = server.arg("resolution");
+    if (server.hasArg("quality")) savedQuality = constrain(server.arg("quality").toInt(), 10, 63);
+    if (server.hasArg("brightness")) savedBrightness = constrain(server.arg("brightness").toInt(), -2, 2);
+    if (server.hasArg("contrast")) savedContrast = constrain(server.arg("contrast").toInt(), -2, 2);
+    if (server.hasArg("saturation")) savedSaturation = constrain(server.arg("saturation").toInt(), -2, 2);
+    if (server.hasArg("sharpness")) savedSharpness = constrain(server.arg("sharpness").toInt(), -2, 2);
+    if (server.hasArg("hmirror")) savedHmirror = server.arg("hmirror").toInt() ? 1 : 0;
+    if (server.hasArg("vflip")) savedVflip = server.arg("vflip").toInt() ? 1 : 0;
+    savePersistentSettings();
+    server.send(200, "text/plain", "Camera settings applied and saved permanently");
+  } else {
+    server.send(500, "text/plain", "One or more settings are not supported by this camera sensor");
+  }
+}
+
+// =================================================
+// FLASH LED CONTROL
+// =================================================
+
+void handleFlashControl() {
+  if (!server.hasArg("state")) {
+    server.send(400, "text/plain", "Missing state argument");
+    return;
+  }
+
+  String state = server.arg("state");
+  if (state != "on" && state != "off") {
+    server.send(400, "text/plain", "State must be on or off");
+    return;
+  }
+
+  flashLedOn = (state == "on");
+  digitalWrite(FLASH_LED_GPIO, flashLedOn ? HIGH : LOW);
+  server.send(200, "text/plain", flashLedOn ? "Flashlight is ON" : "Flashlight is OFF");
+}
+
+// =================================================
+// PHOTO CAPTURE
+// =================================================
+
+void handlePhoto() {
+
+  if (!cameraReady || !sdReady) {
+    server.send(500, "text/plain", "Camera or SD unavailable");
+    return;
+  }
+
+  if (recording) {
+    server.send(409, "text/plain", "Stop recording before taking a photo");
+    return;
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+
+  String path =
+    "/photos/PHOTO_" + String(millis()) + ".jpg";
+
+  File file = SD_MMC.open(path, FILE_WRITE);
+
+  if (!file) {
+
+    esp_camera_fb_return(fb);
+
+    server.send(500, "text/plain", "Cannot save photo");
+    return;
+  }
+
+  size_t written = file.write(fb->buf, fb->len);
+
+  file.close();
+
+  esp_camera_fb_return(fb);
+
+  if (written == 0) {
+    server.send(500, "text/plain", "Photo save failed");
+    return;
+  }
+
+  Serial.print("PHOTO SAVED: ");
+  Serial.println(path);
+
+  server.send(200, "text/plain", "Photo saved: " + path);
+}
+
+// =================================================
+// LIVE PREVIEW
+// =================================================
+
+void handlePreview() {
+
+  if (!cameraReady) {
+    server.send(503, "text/plain", "Camera unavailable");
+    return;
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    server.send(500, "text/plain", "Capture failed");
+    return;
+  }
+
+  server.setContentLength(fb->len);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "image/jpeg", "");
+
+  server.sendContent(
+    (const char*)fb->buf,
+    fb->len
+  );
+
+  esp_camera_fb_return(fb);
+}
+
+// =================================================
+// START / STOP RECORDING ROUTES
+// =================================================
+
+void handleRecordStart() {
+
+  if (recording) {
+    server.send(200, "text/plain", "Already recording");
+    return;
+  }
+
+  if (startRecording()) {
+    server.send(200, "text/plain", "Recording started");
+  } else {
+    server.send(500, "text/plain", "Recording failed");
+  }
+}
+
+void handleRecordStop() {
+
+  if (!recording) {
+    server.send(200, "text/plain", "Not recording");
+    return;
+  }
+
+  stopRecording();
+
+  server.send(200, "text/plain", "Video saved successfully");
+}
+
+// =================================================
+// SAFE FILE PATH CHECK
+// =================================================
+
+bool validMediaPath(String path) {
+
+  if (
+    !path.startsWith("/photos/") &&
+    !path.startsWith("/videos/")
+  ) {
+    return false;
+  }
+
+  if (
+    path.indexOf("..") >= 0 ||
+    path.indexOf('\\') >= 0
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+// =================================================
+// VIEW / DOWNLOAD FILE
+// =================================================
+
+void handleFile() {
+
+  String path = server.arg("name");
+
+  if (!validMediaPath(path)) {
+    server.send(400, "text/plain", "Invalid file path");
+    return;
+  }
+
+  if (recording && path == currentVideoPath) {
+    server.send(409, "text/plain", "Video is still recording");
+    return;
+  }
+
+  if (!SD_MMC.exists(path)) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  File file = SD_MMC.open(path, FILE_READ);
+
+  if (!file) {
+    server.send(500, "text/plain", "Cannot open file");
+    return;
+  }
+
+  if (path.endsWith(".avi")) {
+
+    server.sendHeader(
+      "Content-Disposition",
+      "attachment; filename=\"" +
+      path.substring(path.lastIndexOf('/') + 1) + "\""
+    );
+
+    server.streamFile(file, "application/octet-stream");
+
+  } else {
+
+    server.streamFile(file, "image/jpeg");
+  }
+
+  file.close();
+}
+
+// =================================================
+// DELETE SINGLE FILE
+// =================================================
+
+void handleDelete() {
+
+  String path = server.arg("name");
+
+  if (!validMediaPath(path)) {
+    server.send(400, "text/plain", "Invalid path");
+    return;
+  }
+
+  if (recording && path == currentVideoPath) {
+    server.send(409, "text/plain", "Cannot delete active recording");
+    return;
+  }
+
+  if (!SD_MMC.exists(path)) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  if (SD_MMC.remove(path)) {
+
+    Serial.print("DELETED: ");
+    Serial.println(path);
+
+    server.send(200, "text/plain", "File deleted");
+
+  } else {
+
+    server.send(500, "text/plain", "Delete failed");
+  }
+}
+
+// =================================================
+// COUNT FILES
+// =================================================
+
+uint32_t countFiles(const char *directory) {
+
+  File dir = SD_MMC.open(directory);
+
+  if (!dir || !dir.isDirectory()) {
+    return 0;
+  }
+
+  uint32_t count = 0;
+
+  File file = dir.openNextFile();
+
+  while (file) {
+
+    if (!file.isDirectory()) {
+      count++;
+    }
+
+    file.close();
+    file = dir.openNextFile();
+  }
+
+  dir.close();
+
+  return count;
+}
+
+// =================================================
+// GALLERY API
+// =================================================
+
+void appendDirectoryJSON(
+  const char *directory,
+  const char *type,
+  String &json,
+  bool &first
+) {
+
+  File dir = SD_MMC.open(directory);
+
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  File file = dir.openNextFile();
+
+  while (file) {
+
+    if (!file.isDirectory()) {
+
+      String name = file.name();
+
+      if (!name.startsWith("/")) {
+        name = String(directory) + "/" + name;
+      }
+
+      if (!first) {
+        json += ",";
+      }
+
+      first = false;
+
+      json += "{\"name\":\"";
+      json += name;
+      json += "\",\"type\":\"";
+      json += type;
+      json += "\",\"size\":";
+      json += String(file.size());
+      json += "}";
+    }
+
+    file.close();
+    file = dir.openNextFile();
+  }
+
+  dir.close();
+}
+
+void handleGallery() {
+
+  String json = "[";
+  bool first = true;
+
+  appendDirectoryJSON(
+    "/photos", "photo", json, first
+  );
+
+  appendDirectoryJSON(
+    "/videos", "video", json, first
+  );
+
+  json += "]";
+
+  server.send(200, "application/json", json);
+}
+
+// =================================================
+// STORAGE INFORMATION
+// =================================================
+
+void handleStorage() {
+
+  if (!sdReady) {
+    server.send(503, "application/json",
+                "{\"error\":\"SD card unavailable\"}");
+    return;
+  }
+
+  uint32_t totalMB =
+    (uint32_t)(SD_MMC.totalBytes() / 1048576ULL);
+
+  uint32_t usedMB =
+    (uint32_t)(SD_MMC.usedBytes() / 1048576ULL);
+
+  uint32_t freeMB =
+    totalMB > usedMB ? totalMB - usedMB : 0;
+
+  String json = "{";
+
+  json += "\"totalMB\":" + String(totalMB) + ",";
+  json += "\"usedMB\":" + String(usedMB) + ",";
+  json += "\"freeMB\":" + String(freeMB) + ",";
+
+  json += "\"photos\":" +
+          String(countFiles("/photos")) + ",";
+
+  json += "\"videos\":" +
+          String(countFiles("/videos")) + ",";
+
+  json += "\"recording\":";
+  json += recording ? "true" : "false";
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// =================================================
+// DELETE ALL MEDIA
+// =================================================
+
+void deleteDirectoryFiles(const char *directory) {
+
+  File dir = SD_MMC.open(directory);
+
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  File file = dir.openNextFile();
+
+  while (file) {
+
+    String name = file.name();
+
+    if (!name.startsWith("/")) {
+      name = String(directory) + "/" + name;
+    }
+
+    bool isDirectory = file.isDirectory();
+
+    file.close();
+
+    if (!isDirectory) {
+
+      if (!(recording && name == currentVideoPath)) {
+        SD_MMC.remove(name);
+      }
+    }
+
+    file = dir.openNextFile();
+  }
+
+  dir.close();
+}
+
+void handleDeleteAll() {
+
+  if (recording) {
+    server.send(
+      409,
+      "text/plain",
+      "Stop recording before deleting all files"
+    );
+    return;
+  }
+
+  deleteDirectoryFiles("/photos");
+  deleteDirectoryFiles("/videos");
+
+  server.send(200, "text/plain", "All media deleted");
+}
+// =================================================
+// CAMERA WEB INTERFACE
+// =================================================
+
+void handleRoot() {
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>ESP32 Camera Pro</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 15px;
+  background: #101419;
+  color: white;
+  font-family: Arial, sans-serif;
+}
+
+.header {
+  text-align: center;
+  color: #00d084;
+  font-size: 24px;
+  font-weight: bold;
+  margin: 15px;
+}
+
+.status {
+  text-align: center;
+  color: #aaa;
+  margin-bottom: 15px;
+}
+
+.camera {
+  width: 100%;
+  max-width: 800px;
+  display: block;
+  margin: auto;
+  border-radius: 12px;
+  background: #000;
+  border: 2px solid #333;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+button {
+  padding: 16px 8px;
+  border: none;
+  border-radius: 10px;
+  color: white;
+  font-size: 15px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.photo {
+  background: #087f50;
+}
+
+.record {
+  background: #c62828;
+}
+
+.stop {
+  background: #555;
+}
+
+.refresh {
+  background: #1769aa;
+}
+
+.deleteall {
+  background: #9c2424;
+}
+
+.card {
+  background: #1c242d;
+  border-radius: 12px;
+  padding: 15px;
+  margin-top: 18px;
+}
+
+.card h3 {
+  color: #00d084;
+  margin-top: 0;
+}
+
+.memory {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.memory div {
+  background: #29333e;
+  padding: 12px;
+  border-radius: 8px;
+}
+
+.value {
+  display: block;
+  font-size: 22px;
+  font-weight: bold;
+  margin-top: 6px;
+}
+
+.item {
+  background: #29333e;
+  padding: 10px;
+  border-radius: 8px;
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+
+.item img {
+  width: 100%;
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+
+.item button {
+  padding: 9px 14px;
+  margin: 5px 5px 0 0;
+  font-size: 13px;
+}
+
+.download {
+  background: #1769aa;
+}
+
+.remove {
+  background: #c62828;
+}
+
+a {
+  color: white;
+  text-decoration: none;
+}
+
+#message {
+  text-align: center;
+  color: #00d084;
+  padding: 10px;
+  overflow-wrap: anywhere;
+}
+
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.setting {
+  background: #29333e;
+  padding: 10px;
+  border-radius: 8px;
+}
+.setting label {
+  display: block;
+  margin-bottom: 7px;
+  color: #ddd;
+  font-size: 14px;
+}
+.setting select, .setting input {
+  width: 100%;
+  padding: 10px;
+  border: 0;
+  border-radius: 7px;
+  background: #fff;
+  color: #111;
+}
+.setting input[type="range"] {
+  padding: 0;
+}
+.setting-value {
+  color: #00d084;
+  font-weight: bold;
+}
+.settings-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.apply-settings {
+  background: #1769aa;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="header">CAMERA CONTROL</div>
+
+<div class="status" id="status">
+  CAMERA READY
+</div>
+
+<img id="preview" class="camera" src="/preview">
+
+<div class="controls">
+
+  <button class="photo" onclick="takePhoto()">
+    CAPTURE PHOTO
+  </button>
+
+  <button class="record" id="cctvBtn" onclick="toggleCCTV()">
+    CCTV RECORDING: OFF
+  </button>
+
+  <button class="refresh" onclick="refreshAll()">
+    REFRESH GALLERY
+  </button>
+
+  <button class="apply-settings" id="flashBtn" onclick="toggleFlash()">
+    FLASHLIGHT: OFF
+  </button>
+
+</div>
+
+<div class="card">
+  <h3>⚙️ CAMERA SETTINGS</h3>
+
+  <div class="settings-grid">
+    <div class="setting">
+      <label for="resolution">Resolution</label>
+      <select id="resolution">
+        <option value="QQVGA">QQVGA - 160 x 120</option>
+        <option value="QVGA" selected>QVGA - 320 x 240</option>
+        <option value="VGA">VGA - 640 x 480</option>
+        <option value="SVGA">SVGA - 800 x 600</option>
+        <option value="XGA">XGA - 1024 x 768</option>
+        <option value="HD">HD - 1280 x 720</option>
+        <option value="SXGA">SXGA - 1280 x 1024</option>
+        <option value="UXGA">UXGA - 1600 x 1200</option>
+      </select>
+    </div>
+
+    <div class="setting">
+      <label for="quality">JPEG Quality <span class="setting-value" id="qualityValue">12</span></label>
+      <input id="quality" type="range" min="10" max="63" value="12"
+             oninput="showSettingValue('quality')">
+      <small>Lower number = better image quality and larger files.</small>
+    </div>
+
+    <div class="setting">
+      <label for="brightness">Brightness <span class="setting-value" id="brightnessValue">1</span></label>
+      <input id="brightness" type="range" min="-2" max="2" value="1"
+             oninput="showSettingValue('brightness')">
+    </div>
+
+    <div class="setting">
+      <label for="contrast">Contrast <span class="setting-value" id="contrastValue">0</span></label>
+      <input id="contrast" type="range" min="-2" max="2" value="0"
+             oninput="showSettingValue('contrast')">
+    </div>
+
+    <div class="setting">
+      <label for="saturation">Saturation <span class="setting-value" id="saturationValue">0</span></label>
+      <input id="saturation" type="range" min="-2" max="2" value="0"
+             oninput="showSettingValue('saturation')">
+    </div>
+
+    <div class="setting">
+      <label for="sharpness">Sharpness <span class="setting-value" id="sharpnessValue">0</span></label>
+      <input id="sharpness" type="range" min="-2" max="2" value="0"
+             oninput="showSettingValue('sharpness')">
+    </div>
+
+    <div class="setting">
+      <label for="rotation">Image Rotation</label>
+      <select id="rotation">
+        <option value="0">0° - Normal</option>
+        <option value="180">180° - Upside down</option>
+      </select>
+      <small>180° uses sensor vertical flip and horizontal mirror.</small>
+    </div>
+
+    <div class="setting">
+      <label for="mirror">Mirror Image</label>
+      <select id="mirror">
+        <option value="0">Off</option>
+        <option value="1">On</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="settings-actions">
+    <button class="apply-settings" onclick="applyCameraSettings()">APPLY SETTINGS</button>
+    <button class="refresh" onclick="resetCameraSettings()">RESET SETTINGS</button>
+  </div>
+  <small>Stop video recording before applying settings. Supported resolutions depend on your camera sensor and available memory.</small>
+</div>
+
+<div id="message"></div>
+
+<div class="card">
+
+  <h3>SD CARD MEMORY</h3>
+
+  <div class="memory">
+
+    <div>
+      Total
+      <span class="value" id="total">--</span>
+    </div>
+
+    <div>
+      Used
+      <span class="value" id="used">--</span>
+    </div>
+
+    <div>
+      Free
+      <span class="value" id="free">--</span>
+    </div>
+
+    <div>
+      Photos
+      <span class="value" id="photos">0</span>
+    </div>
+
+    <div>
+      Videos
+      <span class="value" id="videos">0</span>
+    </div>
+
+    <div>
+      Recording
+      <span class="value" id="recStatus">NO</span>
+    </div>
+
+  </div>
+
+</div>
+
+<div class="card">
+
+  <h3>PHOTO & VIDEO GALLERY</h3>
+
+  <div id="gallery">
+    Loading gallery...
+  </div>
+
+  <button class="deleteall" onclick="deleteAll()">
+    DELETE ALL MEDIA
+  </button>
+
+</div>
+
+<script>
+
+const message = document.getElementById("message");
+
+async function request(url) {
+
+  const response = await fetch(url);
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(text);
+  }
+
+  return text;
+}
+
+async function loadSavedSettings() {
+  const response = await fetch("/api/settings");
+  const cfg = await response.json();
+  document.getElementById("resolution").value = cfg.resolution;
+  document.getElementById("quality").value = cfg.quality;
+  document.getElementById("brightness").value = cfg.brightness;
+  document.getElementById("contrast").value = cfg.contrast;
+  document.getElementById("saturation").value = cfg.saturation;
+  document.getElementById("sharpness").value = cfg.sharpness;
+  document.getElementById("rotation").value = cfg.vflip ? "180" : "0";
+  document.getElementById("mirror").value = cfg.hmirror && !cfg.vflip ? "1" : "0";
+  ["quality", "brightness", "contrast", "saturation", "sharpness"].forEach(showSettingValue);
+}
+
+let cctvIsOn = false;
+async function loadCCTVState() {
+  const response = await fetch("/api/cctv/status");
+  const data = await response.json();
+  cctvIsOn = !!data.enabled;
+  updateCCTVButton();
+}
+function updateCCTVButton() {
+  const button = document.getElementById("cctvBtn");
+  if (!button) return;
+  button.innerText = cctvIsOn ? "CCTV RECORDING: ON" : "CCTV RECORDING: OFF";
+  button.style.background = cctvIsOn ? "#087f50" : "#c62828";
+}
+async function toggleCCTV() {
+  try {
+    const next = !cctvIsOn;
+    const result = await request("/api/cctv?state=" + (next ? "on" : "off"));
+    cctvIsOn = next;
+    updateCCTVButton();
+    message.innerText = result;
+    refreshAll();
+  } catch (e) {
+    message.innerText = "CCTV error: " + e.message;
+  }
+}
+
+function showSettingValue(id) {
+  const input = document.getElementById(id);
+  const output = document.getElementById(id + "Value");
+  if (input && output) output.innerText = input.value;
+}
+
+async function applyCameraSettings() {
+  try {
+    if (document.getElementById("recStatus").innerText === "YES") {
+      throw new Error("Stop recording before changing camera settings");
+    }
+
+    const params = new URLSearchParams();
+    params.set("resolution", document.getElementById("resolution").value);
+    params.set("quality", document.getElementById("quality").value);
+    params.set("brightness", document.getElementById("brightness").value);
+    params.set("contrast", document.getElementById("contrast").value);
+    params.set("saturation", document.getElementById("saturation").value);
+    params.set("sharpness", document.getElementById("sharpness").value);
+
+    const rotate180 = document.getElementById("rotation").value === "180";
+    const mirror = document.getElementById("mirror").value === "1";
+    params.set("hmirror", (rotate180 || mirror) ? "1" : "0");
+    params.set("vflip", rotate180 ? "1" : "0");
+
+    message.innerText = "Applying camera settings...";
+    const result = await request("/api/camera/settings?" + params.toString());
+    message.innerText = result;
+
+    // Discard one stale preview frame after changing sensor settings.
+    setTimeout(() => {
+      document.getElementById("preview").src = "/preview?t=" + Date.now();
+    }, 300);
+  } catch(e) {
+    message.innerText = "Settings error: " + e.message;
+  }
+}
+
+function resetCameraSettings() {
+  document.getElementById("resolution").value = "QVGA";
+  document.getElementById("quality").value = "12";
+  document.getElementById("brightness").value = "1";
+  document.getElementById("contrast").value = "0";
+  document.getElementById("saturation").value = "0";
+  document.getElementById("sharpness").value = "0";
+  document.getElementById("rotation").value = "0";
+  document.getElementById("mirror").value = "0";
+
+  ["quality", "brightness", "contrast", "saturation", "sharpness"]
+    .forEach(showSettingValue);
+
+  applyCameraSettings();
+}
+
+let flashIsOn = false;
+
+async function toggleFlash() {
+  try {
+    const nextState = !flashIsOn;
+    const result = await request("/api/flash?state=" + (nextState ? "on" : "off"));
+    flashIsOn = nextState;
+    const button = document.getElementById("flashBtn");
+    button.innerText = flashIsOn ? "FLASHLIGHT: ON" : "FLASHLIGHT: OFF";
+    button.style.background = flashIsOn ? "#c62828" : "#1769aa";
+    message.innerText = result;
+  } catch(e) {
+    message.innerText = "Flashlight error: " + e.message;
+  }
+}
+
+async function takePhoto() {
+
+  try {
+
+    message.innerText = "Capturing photo...";
+
+    const result = await request("/api/photo");
+
+    message.innerText = result;
+
+    refreshAll();
+
+  } catch(e) {
+
+    message.innerText = "Error: " + e.message;
+  }
+}
+
+async function loadMemory() {
+
+  const response = await fetch("/api/storage");
+
+  const data = await response.json();
+
+  if(data.error) throw new Error(data.error);
+
+  document.getElementById("total").innerText =
+    data.totalMB + " MB";
+
+  document.getElementById("used").innerText =
+    data.usedMB + " MB";
+
+  document.getElementById("free").innerText =
+    data.freeMB + " MB";
+
+  document.getElementById("photos").innerText =
+    data.photos;
+
+  document.getElementById("videos").innerText =
+    data.videos;
+
+  document.getElementById("recStatus").innerText =
+    data.recording ? "YES" : "NO";
+
+  document.getElementById("status").innerText =
+    data.recording ? "VIDEO RECORDING ACTIVE" : "CAMERA READY";
+}
+
+async function loadGallery() {
+
+  const response = await fetch("/api/files");
+
+  const files = await response.json();
+
+  const gallery = document.getElementById("gallery");
+
+  gallery.innerHTML = "";
+
+  if(files.length === 0) {
+
+    gallery.innerHTML = "No photos or videos saved yet.";
+
+    return;
+  }
+
+  files.reverse();
+
+  files.forEach(file => {
+
+    const item = document.createElement("div");
+
+    item.className = "item";
+
+    const name = document.createElement("div");
+
+    name.innerText = file.name;
+
+    item.appendChild(name);
+
+    const size = document.createElement("div");
+
+    size.innerText =
+      (file.size / 1024).toFixed(1) + " KB";
+
+    item.appendChild(size);
+
+    const url =
+      "/file?name=" + encodeURIComponent(file.name);
+
+    if(file.type === "photo") {
+
+      const img = document.createElement("img");
+
+      img.src = url;
+
+      img.loading = "lazy";
+
+      item.appendChild(img);
+
+    } else {
+
+      const video = document.createElement("div");
+
+      video.innerText = "VIDEO FILE (AVI)";
+
+      item.appendChild(video);
+    }
+
+    const download = document.createElement("a");
+
+    download.href = url;
+    download.download = file.name.split("/").pop();
+
+    const downloadBtn = document.createElement("button");
+
+    downloadBtn.className = "download";
+    downloadBtn.innerText = "DOWNLOAD";
+
+    download.appendChild(downloadBtn);
+
+    item.appendChild(download);
+
+    const del = document.createElement("button");
+
+    del.className = "remove";
+    del.innerText = "DELETE";
+
+    del.onclick = async () => {
+
+      if(!confirm("Delete this file?")) return;
+
+      try {
+
+        await request(
+          "/api/delete?name=" +
+          encodeURIComponent(file.name)
+        );
+
+        refreshAll();
+
+      } catch(e) {
+
+        message.innerText = "Error: " + e.message;
+      }
+    };
+
+    item.appendChild(del);
+
+    gallery.appendChild(item);
+  });
+}
+
+async function deleteAll() {
+
+  if(!confirm("Delete ALL photos and videos?")) return;
+
+  try {
+
+    const result = await request("/api/delete-all");
+
+    message.innerText = result;
+
+    refreshAll();
+
+  } catch(e) {
+
+    message.innerText = "Error: " + e.message;
+  }
+}
+
+async function refreshAll() {
+
+  try {
+
+    await loadMemory();
+
+    await loadGallery();
+
+    await loadCCTVState();
+
+  } catch(e) {
+
+    message.innerText = "Error: " + e.message;
+  }
+}
+
+// Continuous live preview: request the next frame only after the
+// previous frame has fully loaded. This prevents overlapping requests
+// and reduces visible lag compared with a fixed 500 ms interval.
+const previewImage = document.getElementById("preview");
+let previewFrameNumber = 0;
+let previewRetryTimer = null;
+
+function requestNextPreviewFrame() {
+  if (document.hidden) return;
+  previewImage.src = "/preview?frame=" + (++previewFrameNumber);
+}
+
+previewImage.onload = () => {
+  if (!document.hidden) {
+    requestAnimationFrame(requestNextPreviewFrame);
+  }
+};
+
+previewImage.onerror = () => {
+  if (!document.hidden) {
+    clearTimeout(previewRetryTimer);
+    previewRetryTimer = setTimeout(requestNextPreviewFrame, 150);
+  }
+};
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) requestNextPreviewFrame();
+  else clearTimeout(previewRetryTimer);
+});
+
+requestNextPreviewFrame();
+
+// Update memory and gallery
+
+setInterval(refreshAll, 5000);
+
+refreshAll();
+loadSavedSettings().catch(e => message.innerText = "Settings load error: " + e.message);
+loadCCTVState().catch(e => message.innerText = "CCTV status error: " + e.message);
+
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+// =================================================
+// SETUP CAMERA
+// =================================================
+
+bool startCamera() {
+
+  camera_config_t config = {};
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 10000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+
+  if (psramFound()) {
+
+    Serial.println("PSRAM FOUND");
+
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+
+  } else {
+
+    Serial.println("PSRAM NOT FOUND");
+
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.frame_size = FRAMESIZE_QQVGA;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+
+    Serial.printf(
+      "Camera initialization failed: 0x%x\n",
+      err
+    );
+
+    return false;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if(sensor != NULL) {
+
+    sensor->set_brightness(sensor, 1);
+    sensor->set_saturation(sensor, 0);
+  }
+
+  Serial.println("Camera initialized!");
+
+  return true;
+}
+
+// =================================================
+// SETUP SD CARD
+// =================================================
+
+bool startSDCard() {
+
+  Serial.println("Initializing SD card...");
+
+  SD_MMC.setPins(
+    SD_MMC_CLK,
+    SD_MMC_CMD,
+    SD_MMC_D0
+  );
+
+  if(!SD_MMC.begin("/sdcard", true)) {
+
+    Serial.println("SD card mount failed!");
+
+    return false;
+  }
+
+  if(SD_MMC.cardType() == CARD_NONE) {
+
+    Serial.println("No SD card detected!");
+
+    return false;
+  }
+
+  if(!SD_MMC.exists("/photos")) {
+    SD_MMC.mkdir("/photos");
+  }
+
+  if(!SD_MMC.exists("/videos")) {
+    SD_MMC.mkdir("/videos");
+  }
+
+  Serial.println("SD card ready!");
+
+  Serial.print("Card size: ");
+  Serial.print(SD_MMC.cardSize() / (1024 * 1024));
+  Serial.println(" MB");
+
+  return true;
+}
+
+// =================================================
+// START WIFI
+// =================================================
+
+void startWiFi() {
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+
+  WiFi.softAPConfig(
+    IPAddress(192, 168, 4, 1),
+    IPAddress(192, 168, 4, 1),
+    IPAddress(255, 255, 255, 0)
+  );
+
+  if(WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+
+    Serial.println("HOTSPOT STARTED");
+
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  Serial.println("Connecting to Airtel...");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int timeout = 0;
+
+  while(
+    WiFi.status() != WL_CONNECTED &&
+    timeout < 30
+  ) {
+
+    delay(500);
+    Serial.print(".");
+
+    timeout++;
+  }
+
+  if(WiFi.status() == WL_CONNECTED) {
+
+    Serial.println("\nAIRTEL CONNECTED");
+
+    Serial.print("Airtel IP: ");
+    Serial.println(WiFi.localIP());
+
+  } else {
+
+    Serial.println("\nAirtel connection failed.");
+    Serial.println("Hotspot still available.");
+  }
+}
+
+// =================================================
+// SETUP
+// =================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(FLASH_LED_GPIO, OUTPUT);
+  digitalWrite(FLASH_LED_GPIO, LOW);
+  flashLedOn = false;
+
+  delay(1000);
+
+  loadPersistentSettings();
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ESP32-S3 CAMERA CONTROL");
+  Serial.println("================================");
+
+  cameraReady = startCamera();
+
+  if(!cameraReady) {
+
+    Serial.println("CAMERA ERROR!");
+    return;
+  }
+
+  if (!applyPersistentCameraSettings()) {
+    Serial.println("Warning: some saved camera settings were not supported.");
+  }
+
+  sdReady = startSDCard();
+
+  if(!sdReady) {
+
+    Serial.println("SD CARD ERROR!");
+    Serial.println("Check card and SD pins.");
+  }
+
+  startWiFi();
+
+  // WEB ROUTES
+
+  server.on("/", HTTP_GET, handleRoot);
+
+  server.on("/preview", HTTP_GET, handlePreview);
+
+  server.on("/api/flash", HTTP_GET, handleFlashControl);
+
+  server.on("/api/camera/settings", HTTP_GET, handleCameraSettings);
+
+  server.on("/api/settings", HTTP_GET, handleSavedSettings);
+
+  server.on("/api/cctv", HTTP_GET, handleCCTVToggle);
+
+  server.on("/api/cctv/status", HTTP_GET, handleCCTVStatus);
+
+  server.on("/api/photo", HTTP_GET, handlePhoto);
+
+  server.on("/api/record/start", HTTP_GET, handleRecordStart);
+
+  server.on("/api/record/stop", HTTP_GET, handleRecordStop);
+
+  server.on("/api/files", HTTP_GET, handleGallery);
+
+  server.on("/api/storage", HTTP_GET, handleStorage);
+
+  server.on("/file", HTTP_GET, handleFile);
+
+  server.on("/api/delete", HTTP_GET, handleDelete);
+
+  server.on("/api/delete-all", HTTP_GET, handleDeleteAll);
+
+  server.begin();
+
+  // CCTV mode is remembered in NVS. If it was ON before power loss,
+  // resume recording automatically after camera and SD card are ready.
+  if (cctvEnabled) {
+    Serial.println("Saved CCTV mode is ON. Resuming recording...");
+    if (!startRecording()) {
+      Serial.println("Automatic recording failed. Check SD card and camera.");
+    }
+  }
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("CAMERA PRO READY");
+
+  Serial.println("AP URL:");
+  Serial.println("http://192.168.4.1");
+
+  if(WiFi.status() == WL_CONNECTED) {
+
+    Serial.print("AIRTEL URL: http://");
+    Serial.println(WiFi.localIP());
+  }
+
+  Serial.println("================================");
+}
+
+// =================================================
+// MAIN LOOP
+// =================================================
+
+void loop() {
+
+  server.handleClient();
+
+  // RECORD VIDEO FRAMES
+
+  if(recording) {
+
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if(fb) {
+
+      writeAviFrame(fb);
+
+      esp_camera_fb_return(fb);
+
+      // Keep CCTV mode recording by starting a fresh AVI segment when the
+      // current segment reaches MAX_VIDEO_FRAMES.
+      if (cctvEnabled && videoSegmentLimitReached && !recording) {
+        videoSegmentLimitReached = false;
+        startRecording();
+      }
+
+    } else {
+
+      Serial.println("Frame capture failed");
+    }
+
+    delay(100);
+  }
+
+  delay(2);
+}
